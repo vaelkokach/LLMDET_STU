@@ -6,11 +6,17 @@ detector:
   text_prompt: "student"
   score_thr: 0.35
   max_det: 80
+  min_rel_area: 0.01
+  max_rel_area: 0.60
+  min_aspect_ratio: 0.22
+  max_aspect_ratio: 1.25
+  nms_iou_thr: 0.5
   device: "cuda:0"
 
 tracking:
   iou_match_thr: 0.35
   max_age: 30
+  min_hits: 3
 
 features:
   clip_model_name: "openai/clip-vit-base-patch32"
@@ -43,8 +49,10 @@ training:
 inference:
   window_size: 32
   min_frames_for_pred: 4
+  label_smooth_window: 9
+  label_switch_margin: 2
 
 privacy:
-  anonymize_faces: true
+  anonymize_faces: false
 
 temporal_checkpoint: "work_dirs/attention_temporal/checkpoints/best.pth"

@@ -257,7 +257,7 @@ Key config defaults:
 - detector config: `configs/grounding_dino_swin_t.py`
 - frozen checkpoint: `work_dirs/grounding_dino_swin_t/iter_15000.pth`
 - temporal classes: `attentive`, `distracted`, `sleeping`, `engaged`
-- privacy: face-region blur enabled in visualization
+- privacy: face-region blur disabled by default in current config (`privacy.anonymize_faces: false`)
 
 Important troubleshooting notes:
 
@@ -283,6 +283,23 @@ Important troubleshooting notes:
 - run realtime inference with `--no-show`.
 - if you still need visualization output, also pass `--out-video <path>.mp4`.
 - GUI mode (`--show`) should be used only on machines with an active display.
+
+5. Non-student objects receiving boxes/IDs in realtime output
+
+- tune detector geometric filters in `configs/attention_temporal.yaml`:
+  - `detector.min_rel_area`
+  - `detector.max_rel_area`
+  - `detector.min_aspect_ratio`
+  - `detector.max_aspect_ratio`
+  - `detector.nms_iou_thr`
+- these filters remove many desk/object false positives while keeping person-like boxes.
+
+6. Label flicker between frames
+
+- increase temporal smoothing settings in `configs/attention_temporal.yaml`:
+  - `inference.label_smooth_window`
+  - `inference.label_switch_margin`
+- `tracking.min_hits` can also reduce unstable short-lived IDs.
 
 What Phase-1 optimizes for:
 

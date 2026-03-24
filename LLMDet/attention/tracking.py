@@ -33,12 +33,14 @@ class IoUTracker:
     Lightweight online tracker for Phase 1.
     """
 
-    def __init__(self, iou_match_thr: float = 0.35, max_age: int = 30):
+    def __init__(self, iou_match_thr: float = 0.35, max_age: int = 30, min_hits: int = 3):
         self.iou_match_thr = iou_match_thr
         self.max_age = max_age
+        self.min_hits = min_hits
         self.next_id = 1
         self.tracks: Dict[int, List[float]] = {}
         self.ages: Dict[int, int] = {}
+        self.hits: Dict[int, int] = {}
 
     def update(self, detections: List[DetectionResult]) -> List[Track]:
         det_used = set()
@@ -62,6 +64,7 @@ class IoUTracker:
         for tid, di in matched:
             self.tracks[tid] = detections[di].bbox_xyxy
             self.ages[tid] = 0
+            self.hits[tid] = self.hits.get(tid, 0) + 1
 
         for di, det in enumerate(detections):
             if di in det_used:
@@ -70,6 +73,7 @@ class IoUTracker:
             self.next_id += 1
             self.tracks[tid] = det.bbox_xyxy
             self.ages[tid] = 0
+            self.hits[tid] = 1
 
         remove = []
         matched_ids = {tid for tid, _ in matched}
@@ -81,9 +85,12 @@ class IoUTracker:
         for tid in remove:
             self.tracks.pop(tid, None)
             self.ages.pop(tid, None)
+            self.hits.pop(tid, None)
 
         output = []
         for tid, bbox in self.tracks.items():
+            if self.hits.get(tid, 0) < self.min_hits:
+                continue
             output.append(Track(track_id=tid, bbox_xyxy=bbox, score=1.0))
         return output
 

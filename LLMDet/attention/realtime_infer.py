@@ -76,8 +76,17 @@ def main():
         score_thr=float(cfg["detector"].get("score_thr", 0.35)),
         device=cfg["detector"].get("device", "cuda:0"),
         max_det=int(cfg["detector"].get("max_det", 100)),
+        min_rel_area=float(cfg["detector"].get("min_rel_area", 0.01)),
+        max_rel_area=float(cfg["detector"].get("max_rel_area", 0.60)),
+        min_aspect_ratio=float(cfg["detector"].get("min_aspect_ratio", 0.22)),
+        max_aspect_ratio=float(cfg["detector"].get("max_aspect_ratio", 1.25)),
+        nms_iou_thr=float(cfg["detector"].get("nms_iou_thr", 0.5)),
     )
-    tracker = IoUTracker(iou_match_thr=float(cfg["tracking"].get("iou_match_thr", 0.35)), max_age=int(cfg["tracking"].get("max_age", 30)))
+    tracker = IoUTracker(
+        iou_match_thr=float(cfg["tracking"].get("iou_match_thr", 0.35)),
+        max_age=int(cfg["tracking"].get("max_age", 30)),
+        min_hits=int(cfg["tracking"].get("min_hits", 3)),
+    )
     feat = StudentFeatureExtractor(
         clip_model_name=cfg["features"].get("clip_model_name", "openai/clip-vit-base-patch32"),
         device=cfg["features"].get("device", "cuda:0"),
@@ -100,6 +109,9 @@ def main():
     win = int(cfg["inference"]["window_size"])
     feats: Dict[int, Deque[np.ndarray]] = defaultdict(lambda: deque(maxlen=win))
     latest_score: Dict[int, float] = {}
+    label_hist: Dict[int, Deque[int]] = defaultdict(lambda: deque(maxlen=int(cfg["inference"].get("label_smooth_window", 9))))
+    conf_hist: Dict[int, Deque[float]] = defaultdict(lambda: deque(maxlen=int(cfg["inference"].get("label_smooth_window", 9))))
+    stable_label: Dict[int, int] = {}
 
     while True:
         ok, frame = cap.read()
@@ -123,8 +135,24 @@ def main():
             with torch.inference_mode(), torch.cuda.amp.autocast(enabled=device.type == "cuda"):
                 logits = model(x)
                 pred, conf = logits_to_pred(logits)
-            label = CLASS_NAMES[int(pred.item())]
-            score = float(conf.item())
+            raw_label_idx = int(pred.item())
+            raw_conf = float(conf.item())
+            label_hist[t.track_id].append(raw_label_idx)
+            conf_hist[t.track_id].append(raw_conf)
+            # Majority vote smoothing per track.
+            vals = list(label_hist[t.track_id])
+            binc = np.bincount(np.array(vals, dtype=np.int64), minlength=len(CLASS_NAMES))
+            smooth_idx = int(np.argmax(binc))
+            # Hysteresis to suppress rapid flicker.
+            prev_idx = stable_label.get(t.track_id, smooth_idx)
+            if smooth_idx != prev_idx:
+                prev_votes = int(binc[prev_idx]) if prev_idx < len(binc) else 0
+                new_votes = int(binc[smooth_idx])
+                if new_votes - prev_votes < int(cfg["inference"].get("label_switch_margin", 2)):
+                    smooth_idx = prev_idx
+            stable_label[t.track_id] = smooth_idx
+            label = CLASS_NAMES[smooth_idx]
+            score = float(np.mean(conf_hist[t.track_id])) if conf_hist[t.track_id] else raw_conf
             preds[t.track_id] = (label, score)
             latest_score[t.track_id] = CLASS_SCORE.get(label, score)
 
@@ -132,6 +160,9 @@ def main():
             if tid not in active_ids:
                 feats.pop(tid, None)
                 latest_score.pop(tid, None)
+                label_hist.pop(tid, None)
+                conf_hist.pop(tid, None)
+                stable_label.pop(tid, None)
 
         classroom = float(np.mean(list(latest_score.values()))) if latest_score else 0.0
         vis = _blur_faces(frame, tracks) if bool(cfg["privacy"].get("anonymize_faces", True)) else frame.copy()

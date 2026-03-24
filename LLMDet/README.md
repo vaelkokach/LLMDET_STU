@@ -169,6 +169,206 @@ python image_demo.py images/demo.jpeg \
 
 - Please refer to [hf_readme](https://github.com/iSEE-Laboratory/LLMDet/tree/main/hf_model).
 
+#### 5.5 Student Attention Pipeline (Phase 1, Frozen Detector)
+
+This repository now includes an additive Phase-1 pipeline for classroom attention analysis on top of your trained detector checkpoints.
+
+Design goal:
+
+- keep the detection model frozen (avoid detection regression),
+- add temporal behavior modeling as a separate stack,
+- support HPC training (single GPU and multi-GPU DDP),
+- keep privacy safeguards in inference visualization.
+
+Phase-1 files:
+
+- `attention/detector_adapter.py`: loads frozen LLMDet checkpoint and runs student detection.
+- `attention/tracking.py`: online IoU tracker for stable `track_id` across frames.
+- `attention/features.py`: per-student feature extraction (CLIP if available + robust fallback features).
+- `attention/sequence_builder.py`: parses JSONL + filename timestamps, creates temporal samples.
+- `attention/temporal_model.py`: Transformer attention classifier.
+- `attention/train_temporal_ddp.py`: DDP/AMP temporal training script.
+- `attention/realtime_infer.py`: real-time pipeline (detect -> track -> feature -> temporal prediction).
+- `configs/attention_temporal.yaml`: attention pipeline config.
+- wrappers:
+  - `attention_build_sequences.py`
+  - `attention_train.py`
+  - `attention_realtime.py`
+  - `dist_attention_train.sh`
+
+Data expectation:
+
+- annotation JSONL has image `filename` and `grounding.regions[].bbox`.
+- sequence ordering is extracted from filename (`video_xxxx`, frame index, timestamp).
+- image root points to the actual image folder (for student data usually `../grounding_data/stu_img/frames`).
+
+Labeling strategy in Phase-1:
+
+- weak labels are derived from region phrases/tags/caption text (for example: `focused`, `engaged`, `typing`, `sleeping`).
+- per-track sample label is majority vote over frame-level weak labels.
+- this enables training even before full dense temporal annotations are available.
+
+Run order from `LLMDet/`:
+
+1) Build train sequences:
+
+```
+python attention_build_sequences.py \
+  --jsonl ../grounding_data/stu_img/student_behavior_emotion_vg7_train.jsonl \
+  --image-root ../grounding_data/stu_img/frames \
+  --output-dir ../grounding_data/stu_img/attention_sequences/train
+```
+
+2) Build val sequences:
+
+```
+python attention_build_sequences.py \
+  --jsonl ../grounding_data/stu_img/student_behavior_emotion_vg7_val.jsonl \
+  --image-root ../grounding_data/stu_img/frames \
+  --output-dir ../grounding_data/stu_img/attention_sequences/val
+```
+
+3) Train temporal model (single GPU):
+
+```
+python attention_train.py --config configs/attention_temporal.yaml --launcher none
+```
+
+4) Train temporal model (DDP):
+
+```
+bash dist_attention_train.sh configs/attention_temporal.yaml 8
+```
+
+5) Real-time inference:
+
+```
+python attention_realtime.py --config configs/attention_temporal.yaml --source 0
+```
+
+For headless HPC/Jupyter sessions (no display server), run:
+
+```
+python attention_realtime.py --config configs/attention_temporal.yaml --source /path/to/video.mp4 --no-show --out-video work_dirs/attention_temporal/realtime_out.mp4
+```
+
+Key config defaults:
+
+- detector config: `configs/grounding_dino_swin_t.py`
+- frozen checkpoint: `work_dirs/grounding_dino_swin_t/iter_15000.pth`
+- temporal classes: `attentive`, `distracted`, `sleeping`, `engaged`
+- privacy: face-region blur enabled in visualization
+
+Important troubleshooting notes:
+
+1. `Built 0 temporal samples`
+
+- most common cause is wrong `--image-root`.
+- for student data with `frames/` subfolder, use:
+  `--image-root ../grounding_data/stu_img/frames`.
+- if needed, temporarily test with `--min-track-len 1` to validate data flow.
+
+2. CLIP loading error related to `torch.load` security checks
+
+- newer `transformers` can block `.bin` loading on older torch versions.
+- Phase-1 extractor already fails open: CLIP is disabled automatically and fallback features are used.
+- pipeline should continue instead of crashing.
+
+3. TensorFlow oneDNN / cuDNN registration logs during sequence build
+
+- these are environment-level warnings and are non-fatal for this pipeline.
+
+4. OpenCV display crash in headless servers (`qt.qpa.xcb: could not connect to display`)
+
+- run realtime inference with `--no-show`.
+- if you still need visualization output, also pass `--out-video <path>.mp4`.
+- GUI mode (`--show`) should be used only on machines with an active display.
+
+What Phase-1 optimizes for:
+
+- reliable end-to-end pipeline execution with your existing trained detector,
+- minimal disruption to current detection training/inference code,
+- fast iteration on temporal modeling before optional deeper detector-temporal co-training.
+
+Implementation walkthrough across codebase:
+
+1. Entry scripts
+
+- `attention_build_sequences.py` calls `attention.sequence_builder.build_sequences(...)`.
+- `attention_train.py` calls `attention.train_temporal_ddp.main()`.
+- `attention_realtime.py` calls `attention.realtime_infer.main()`.
+
+2. Frozen detection stage
+
+- `attention/detector_adapter.py` loads the detector with existing MMDet APIs:
+  - `mmdet.apis.inference.init_detector`
+  - `mmdet.apis.inference.inference_detector`
+- student prompt and score threshold are configurable in `configs/attention_temporal.yaml`.
+- detector checkpoint is read-only/frozen (no detector weights updated in temporal training).
+
+3. Tracking stage
+
+- `attention/tracking.py` assigns and maintains `track_id` via IoU matching.
+- output structure per frame is a list of tracked objects: `(track_id, bbox_xyxy, score)`.
+
+4. Feature stage
+
+- `attention/features.py` extracts one feature vector per tracked crop:
+  - CLIP embedding (when available),
+  - geometric bbox features,
+  - color statistics features.
+- if CLIP loading fails (for example torch/transformers security gating), code falls back automatically to non-CLIP features and continues.
+
+5. Sequence-building stage (offline preprocessing)
+
+- `attention/sequence_builder.py` parses JSONL lines and:
+  - extracts `video_id`, `frame_idx`, `timestamp` from filename,
+  - groups and sorts observations temporally,
+  - performs track association,
+  - converts each track to a temporal tensor `x` with shape `[T, D]`,
+  - derives weak label `y` from phrases/tags/caption mapping.
+- output is saved as compressed `.npz` files under:
+  - `<output-dir>/sequences/*.npz`
+- metadata summary is saved at:
+  - `<output-dir>/meta.json`
+
+6. Temporal model stage
+
+- `attention/temporal_model.py` defines:
+  - `AttentionTransformer` (default temporal classifier),
+  - `logits_to_pred(...)` utility.
+- classes are configured as:
+  - `attentive`, `distracted`, `sleeping`, `engaged`.
+
+7. Training stage (HPC/DDP)
+
+- `attention/train_temporal_ddp.py`:
+  - loads train/val sequence datasets from `configs/attention_temporal.yaml`,
+  - supports launcher modes `none` and `pytorch`,
+  - uses AMP and gradient clipping,
+  - saves checkpoints to `work_dirs/attention_temporal/checkpoints`,
+  - logs TensorBoard metrics to `work_dirs/attention_temporal/tb`.
+- distributed launcher helper:
+  - `dist_attention_train.sh`.
+
+8. Real-time inference stage
+
+- `attention/realtime_infer.py` runs:
+  - detect -> track -> feature -> temporal prediction.
+- maintains per-track sliding windows.
+- computes per-student prediction + classroom aggregate score.
+- applies optional face-region blur for privacy in visualization output.
+
+9. Configuration source of truth
+
+- `configs/attention_temporal.yaml` controls:
+  - detector config/checkpoint paths,
+  - tracking thresholds,
+  - feature settings,
+  - temporal model dimensions,
+  - sequence dataset paths,
+  - training and inference settings.
+
 ### 6 License
 
 LLMDet is released under the Apache 2.0 license. Please see the LICENSE file for more information.

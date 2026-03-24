@@ -22,7 +22,10 @@ def parse_args():
     p = argparse.ArgumentParser(description="Real-time student attention inference.")
     p.add_argument("--config", type=str, required=True, help="YAML config path.")
     p.add_argument("--source", type=str, default="0", help="Webcam index or video path.")
-    p.add_argument("--show", action="store_true", default=True)
+    p.add_argument("--show", dest="show", action="store_true", help="Display live OpenCV window.")
+    p.add_argument("--no-show", dest="show", action="store_false", help="Run headless without GUI display.")
+    p.set_defaults(show=True)
+    p.add_argument("--out-video", type=str, default="", help="Optional output video path for annotated frames.")
     return p.parse_args()
 
 
@@ -53,6 +56,18 @@ def main():
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open source: {source}")
+    writer = None
+    if args.out_video:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps is None or fps <= 0 or np.isnan(fps):
+            fps = 25.0
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if w <= 0 or h <= 0:
+            w, h = 1280, 720
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(args.out_video, fourcc, fps, (w, h))
+        print(f"[info] writing annotated video to: {args.out_video}")
 
     det = FrozenLLMDetAdapter(
         config_path=cfg["detector"]["config_path"],
@@ -129,12 +144,22 @@ def main():
             cv2.putText(vis, f"id={t.track_id} {label}:{conf:.2f}", (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 2)
 
         cv2.putText(vis, f"classroom_attention={classroom:.2f}", (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2)
-        cv2.imshow("LLMDet Attention Realtime", vis)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+        if writer is not None:
+            writer.write(vis)
+        if args.show:
+            try:
+                cv2.imshow("LLMDet Attention Realtime", vis)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+            except cv2.error as e:
+                print(f"[warn] display is unavailable, switching to headless mode: {e}")
+                args.show = False
 
     cap.release()
-    cv2.destroyAllWindows()
+    if writer is not None:
+        writer.release()
+    if args.show:
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

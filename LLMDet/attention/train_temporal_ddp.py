@@ -1,0 +1,245 @@
+import argparse
+import json
+import os
+import random
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+import yaml
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
+from torch.utils.tensorboard import SummaryWriter
+
+from attention.temporal_model import AttentionTransformer
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+class SequenceNPZDataset(Dataset):
+    def __init__(self, seq_dir: Path):
+        self.files = sorted(seq_dir.glob("*.npz"))
+        if not self.files:
+            raise RuntimeError(f"No .npz files found in {seq_dir}")
+
+    def __len__(self) -> int:
+        return len(self.files)
+
+    def __getitem__(self, idx: int):
+        item = np.load(self.files[idx])
+        x = item["x"].astype(np.float32)
+        y = int(item["y"].item()) if "y" in item else -1
+        return torch.from_numpy(x), torch.tensor(y, dtype=torch.long)
+
+
+def collate_varlen(batch):
+    xs, ys = zip(*batch)
+    max_t = max(x.shape[0] for x in xs)
+    d = xs[0].shape[1]
+    out = torch.zeros((len(xs), max_t, d), dtype=torch.float32)
+    for i, x in enumerate(xs):
+        out[i, : x.shape[0]] = x
+    return out, torch.stack(ys)
+
+
+def init_ddp(launcher: str) -> Tuple[bool, int, int, int]:
+    if launcher == "none":
+        return False, 0, 1, 0
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
+    return True, rank, world_size, local_rank
+
+
+def cleanup_ddp() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="DDP temporal training for student attention.")
+    p.add_argument("--config", type=str, required=True, help="YAML config path.")
+    p.add_argument("--launcher", type=str, default="none", choices=["none", "pytorch"])
+    return p.parse_args()
+
+
+def load_yaml(path: Path) -> Dict:
+    with path.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def train_one_epoch(model, loader, optimizer, scaler, device, cfg):
+    model.train()
+    mode = cfg["training"]["mode"]
+    pseudo_thr = float(cfg["training"].get("pseudo_label_threshold", 0.7))
+    losses, accs = [], []
+
+    for x, y in loader:
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.cuda.amp.autocast(enabled=cfg["training"].get("amp", True) and device.type == "cuda"):
+            logits = model(x)
+            probs = torch.softmax(logits, dim=-1)
+            pred = probs.argmax(dim=-1)
+            valid = y >= 0
+
+            loss = torch.tensor(0.0, device=device)
+            total = 0
+            if valid.any():
+                loss = loss + F.cross_entropy(logits[valid], y[valid])
+                total += 1
+
+            if mode == "semi_supervised":
+                unlabeled = ~valid
+                if unlabeled.any():
+                    conf = probs.max(dim=-1).values
+                    pseudo_mask = unlabeled & (conf >= pseudo_thr)
+                    if pseudo_mask.any():
+                        pseudo = pred.detach()
+                        loss = loss + F.cross_entropy(logits[pseudo_mask], pseudo[pseudo_mask])
+                        total += 1
+            if total == 0:
+                continue
+            loss = loss / total
+
+        scaler.scale(loss).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["training"].get("grad_clip", 1.0))
+        scaler.step(optimizer)
+        scaler.update()
+
+        losses.append(float(loss.item()))
+        if valid.any():
+            accs.append(float((pred[valid] == y[valid]).float().mean().item()))
+    return float(np.mean(losses)) if losses else 0.0, float(np.mean(accs)) if accs else 0.0
+
+
+@torch.no_grad()
+def validate(model, loader, device):
+    model.eval()
+    losses, accs = [], []
+    for x, y in loader:
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        valid = y >= 0
+        if not valid.any():
+            continue
+        logits = model(x)
+        loss = F.cross_entropy(logits[valid], y[valid])
+        pred = logits.argmax(dim=-1)
+        losses.append(float(loss.item()))
+        accs.append(float((pred[valid] == y[valid]).float().mean().item()))
+    return float(np.mean(losses)) if losses else 0.0, float(np.mean(accs)) if accs else 0.0
+
+
+def main():
+    args = parse_args()
+    cfg = load_yaml(Path(args.config))
+    set_seed(int(cfg.get("seed", 42)))
+
+    ddp, rank, _, local_rank = init_ddp(args.launcher)
+    is_main = rank == 0
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+
+    seq_root = Path(cfg["data"]["sequence_dir"])
+    train_set = SequenceNPZDataset(seq_root / "train")
+    val_set = SequenceNPZDataset(seq_root / "val")
+
+    train_sampler = DistributedSampler(train_set, shuffle=True) if ddp else None
+    val_sampler = DistributedSampler(val_set, shuffle=False) if ddp else None
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=int(cfg["training"]["batch_size"]),
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+        num_workers=int(cfg["training"].get("num_workers", 4)),
+        pin_memory=True,
+        collate_fn=collate_varlen,
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=int(cfg["training"]["batch_size"]),
+        shuffle=False,
+        sampler=val_sampler,
+        num_workers=int(cfg["training"].get("num_workers", 4)),
+        pin_memory=True,
+        collate_fn=collate_varlen,
+    )
+
+    model = AttentionTransformer(
+        input_dim=int(cfg["model"]["input_dim"]),
+        hidden_dim=int(cfg["model"]["hidden_dim"]),
+        num_layers=int(cfg["model"]["num_layers"]),
+        num_heads=int(cfg["model"]["num_heads"]),
+        dropout=float(cfg["model"]["dropout"]),
+        num_classes=int(cfg["model"]["num_classes"]),
+        max_seq_len=int(cfg["model"]["max_seq_len"]),
+    ).to(device)
+
+    if ddp:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(cfg["training"]["lr"]),
+        weight_decay=float(cfg["training"].get("weight_decay", 0.01)),
+    )
+    scaler = torch.cuda.amp.GradScaler(enabled=cfg["training"].get("amp", True) and device.type == "cuda")
+
+    out_dir = Path(cfg["training"]["output_dir"])
+    ckpt_dir = out_dir / "checkpoints"
+    tb_dir = out_dir / "tb"
+    if is_main:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        tb_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(str(tb_dir)) if is_main else None
+
+    best_val = -1.0
+    epochs = int(cfg["training"]["epochs"])
+    for epoch in range(epochs):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        tr_loss, tr_acc = train_one_epoch(model, train_loader, optimizer, scaler, device, cfg)
+        va_loss, va_acc = validate(model, val_loader, device)
+
+        if is_main:
+            print(f"[epoch {epoch}] train_loss={tr_loss:.4f} train_acc={tr_acc:.4f} val_loss={va_loss:.4f} val_acc={va_acc:.4f}")
+            if writer is not None:
+                writer.add_scalar("train/loss", tr_loss, epoch)
+                writer.add_scalar("train/acc", tr_acc, epoch)
+                writer.add_scalar("val/loss", va_loss, epoch)
+                writer.add_scalar("val/acc", va_acc, epoch)
+
+            state = {
+                "epoch": epoch,
+                "model": model.module.state_dict() if isinstance(model, DDP) else model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "config": cfg,
+            }
+            torch.save(state, ckpt_dir / f"epoch_{epoch:03d}.pth")
+            if va_acc > best_val:
+                best_val = va_acc
+                torch.save(state, ckpt_dir / "best.pth")
+
+    if is_main and writer is not None:
+        writer.close()
+        with (out_dir / "train_summary.json").open("w", encoding="utf-8") as f:
+            json.dump({"best_val_acc": best_val}, f, indent=2)
+
+    cleanup_ddp()
+
+
+if __name__ == "__main__":
+    main()
+

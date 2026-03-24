@@ -1,0 +1,50 @@
+seed: 42
+
+detector:
+  config_path: "configs/grounding_dino_swin_t.py"
+  checkpoint_path: "work_dirs/grounding_dino_swin_t/iter_15000.pth"
+  text_prompt: "student"
+  score_thr: 0.35
+  max_det: 80
+  device: "cuda:0"
+
+tracking:
+  iou_match_thr: 0.35
+  max_age: 30
+
+features:
+  clip_model_name: "openai/clip-vit-base-patch32"
+  device: "cuda:0"
+
+model:
+  input_dim: 544
+  hidden_dim: 512
+  num_layers: 4
+  num_heads: 8
+  dropout: 0.1
+  num_classes: 4
+  max_seq_len: 128
+
+data:
+  sequence_dir: "../grounding_data/stu_img/attention_sequences"
+
+training:
+  mode: "supervised" # supervised | semi_supervised
+  pseudo_label_threshold: 0.7
+  epochs: 30
+  batch_size: 32
+  num_workers: 4
+  lr: 0.0003
+  weight_decay: 0.01
+  grad_clip: 1.0
+  amp: true
+  output_dir: "work_dirs/attention_temporal"
+
+inference:
+  window_size: 32
+  min_frames_for_pred: 4
+
+privacy:
+  anonymize_faces: true
+
+temporal_checkpoint: "work_dirs/attention_temporal/checkpoints/best.pth"

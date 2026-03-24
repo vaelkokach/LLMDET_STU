@@ -26,9 +26,17 @@ class StudentFeatureExtractor:
         self.clip_model: Optional[CLIPModel] = None
         self.clip_processor: Optional[CLIPProcessor] = None
         if self.clip_enabled:
-            self.clip_processor = CLIPProcessor.from_pretrained(clip_model_name)
-            self.clip_model = CLIPModel.from_pretrained(clip_model_name).to(self.device)
-            self.clip_model.eval()
+            try:
+                self.clip_processor = CLIPProcessor.from_pretrained(clip_model_name)
+                self.clip_model = CLIPModel.from_pretrained(clip_model_name).to(self.device)
+                self.clip_model.eval()
+            except Exception as e:
+                # Keep the pipeline running even if CLIP weights cannot be loaded
+                # (e.g., torch/transformers security gating for .bin checkpoints).
+                print(f"[warn] CLIP disabled; falling back to non-CLIP features: {e}")
+                self.clip_enabled = False
+                self.clip_model = None
+                self.clip_processor = None
 
     def output_dim(self) -> int:
         # 512 clip + 8 bbox geom + 24 color stats

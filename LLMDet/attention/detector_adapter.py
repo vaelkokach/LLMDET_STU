@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -13,6 +13,18 @@ class DetectionResult:
     bbox_xyxy: List[float]
     score: float
     label: int
+
+
+def iou_xyxy(a: Sequence[float], b: Sequence[float]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    xx1, yy1 = max(ax1, bx1), max(ay1, by1)
+    xx2, yy2 = min(ax2, bx2), min(ay2, by2)
+    w, h = max(0.0, xx2 - xx1), max(0.0, yy2 - yy1)
+    inter = w * h
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    return inter / (area_a + area_b - inter + 1e-6)
 
 
 class FrozenLLMDetAdapter:
@@ -139,4 +151,72 @@ class FrozenLLMDetAdapter:
             inds = np.where(iou <= iou_thr)[0]
             order = order[inds + 1]
         return keep
+
+
+class MMDetDetectorAdapter:
+    """
+    Generic detector wrapper for primary person detection or verification.
+    Supports both closed-set MMDet and text-prompted MM-GroundingDINO models.
+    """
+
+    def __init__(
+        self,
+        config_path: str,
+        checkpoint_path: str,
+        score_thr: float = 0.3,
+        device: str = "cuda:0",
+        max_det: int = 100,
+        text_prompt: Optional[str] = None,
+        class_whitelist: Optional[List[int]] = None,
+    ):
+        cfg_path = Path(config_path)
+        ckpt_path = Path(checkpoint_path)
+        if not cfg_path.exists():
+            raise FileNotFoundError(f"Config not found: {cfg_path}")
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        self.score_thr = score_thr
+        self.max_det = max_det
+        self.text_prompt = text_prompt
+        self.class_whitelist = set(class_whitelist or [])
+        self.device = device if torch.cuda.is_available() else "cpu"
+        self.model = init_detector(str(cfg_path), str(ckpt_path), device=self.device)
+
+    def detect(self, frame_bgr: np.ndarray) -> List[DetectionResult]:
+        if self.text_prompt:
+            out = inference_detector(
+                self.model,
+                frame_bgr,
+                text_prompt=self.text_prompt,
+                custom_entities=True,
+            )
+        else:
+            out = inference_detector(self.model, frame_bgr)
+
+        pred = out.pred_instances
+        if pred is None or len(pred) == 0:
+            return []
+
+        bboxes = pred.bboxes.detach().cpu().numpy()
+        scores = pred.scores.detach().cpu().numpy()
+        labels = pred.labels.detach().cpu().numpy()
+
+        keep = scores >= self.score_thr
+        if self.class_whitelist:
+            keep = keep & np.isin(labels, np.array(list(self.class_whitelist), dtype=labels.dtype))
+        bboxes = bboxes[keep]
+        scores = scores[keep]
+        labels = labels[keep]
+        if scores.size == 0:
+            return []
+
+        order = np.argsort(-scores)[: self.max_det]
+        return [
+            DetectionResult(
+                bbox_xyxy=[float(x) for x in bboxes[i].tolist()],
+                score=float(scores[i]),
+                label=int(labels[i]),
+            )
+            for i in order
+        ]
 

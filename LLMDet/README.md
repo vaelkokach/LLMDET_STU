@@ -419,6 +419,52 @@ Implementation walkthrough across codebase:
   - sequence dataset paths,
   - training and inference settings.
 
+#### 5.6 Thesis-Focused LLMDet Fine-Tuning (E1/E2)
+
+To keep thesis scope centered on LLMDet, two ready configs are included:
+
+- `configs/grounding_dino_swin_t_student_e1.py`
+  - student-only continuation from `iter_15000.pth`.
+- `configs/grounding_dino_swin_t_student_e2_hardneg.py`
+  - student + hard-negative continuation (classroom objects as hard negatives).
+
+Run E1:
+
+```
+bash dist_train.sh configs/grounding_dino_swin_t_student_e1.py 8 --amp
+```
+
+Run E2:
+
+```
+bash dist_train.sh configs/grounding_dino_swin_t_student_e2_hardneg.py 8 --amp
+```
+
+E2 prerequisite:
+
+- create `../grounding_data/stu_img/student_hard_negative_vg7_train.jsonl`
+- include classroom object negatives (monitor/desk/chair/keyboard/phone) so detector learns to suppress non-student false positives.
+
+#### 5.7 Hybrid Dual-Detector Inference (Permanent Runtime Fix)
+
+Hybrid mode keeps thesis alignment while improving deployment stability:
+
+- primary detector drives tracking (`hybrid.primary_detector`)
+- LLMDet (`iter_15000.pth`) verifies tracks periodically as a student semantic gate
+
+Enable in `configs/attention_temporal.yaml`:
+
+```
+hybrid:
+  enabled: true
+```
+
+Then run:
+
+```
+python attention_realtime.py --config configs/attention_temporal.yaml --source /path/to/video.mp4 --no-show --out-video work_dirs/attention_temporal/realtime_hybrid.mp4
+```
+
 ### 6 License
 
 LLMDet is released under the Apache 2.0 license. Please see the LICENSE file for more information.

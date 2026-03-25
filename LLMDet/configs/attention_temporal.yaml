@@ -13,6 +13,21 @@ detector:
   nms_iou_thr: 0.5
   device: "cuda:0"
 
+hybrid:
+  enabled: false
+  verify_every_n_frames: 3
+  verify_iou_thr: 0.25
+  primary_detector:
+    # Recommended: person detector checkpoint/config trained for people.
+    # If you use COCO-style detector, class_whitelist often contains person class id [0].
+    config_path: "configs/grounding_dino_swin_t.py"
+    checkpoint_path: "work_dirs/grounding_dino_swin_t/iter_15000.pth"
+    score_thr: 0.30
+    max_det: 120
+    device: "cuda:0"
+    text_prompt: "person"
+    class_whitelist: []
+
 tracking:
   iou_match_thr: 0.20
   max_age: 60

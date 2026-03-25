@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import yaml
 
-from attention.detector_adapter import FrozenLLMDetAdapter
+from attention.detector_adapter import FrozenLLMDetAdapter, MMDetDetectorAdapter, iou_xyxy
 from attention.features import StudentFeatureExtractor
 from attention.temporal_model import AttentionTransformer, logits_to_pred
 from attention.tracking import IoUTracker
@@ -70,6 +70,8 @@ def _det_appearance_feature(frame_bgr: np.ndarray, bbox_xyxy: List[float]) -> np
 def main():
     args = parse_args()
     cfg = load_yaml(Path(args.config))
+    hybrid_cfg = cfg.get("hybrid", {})
+    hybrid_enabled = bool(hybrid_cfg.get("enabled", False))
 
     source = int(args.source) if args.source.isdigit() else args.source
     cap = cv2.VideoCapture(source)
@@ -101,6 +103,19 @@ def main():
         max_aspect_ratio=float(cfg["detector"].get("max_aspect_ratio", 1.25)),
         nms_iou_thr=float(cfg["detector"].get("nms_iou_thr", 0.5)),
     )
+    primary_det = None
+    verifier = None
+    if hybrid_enabled:
+        primary_det = MMDetDetectorAdapter(
+            config_path=hybrid_cfg["primary_detector"]["config_path"],
+            checkpoint_path=hybrid_cfg["primary_detector"]["checkpoint_path"],
+            score_thr=float(hybrid_cfg["primary_detector"].get("score_thr", 0.3)),
+            device=hybrid_cfg["primary_detector"].get("device", cfg["detector"].get("device", "cuda:0")),
+            max_det=int(hybrid_cfg["primary_detector"].get("max_det", 120)),
+            text_prompt=hybrid_cfg["primary_detector"].get("text_prompt", None),
+            class_whitelist=hybrid_cfg["primary_detector"].get("class_whitelist", None),
+        )
+        verifier = det
     tracker = IoUTracker(
         iou_match_thr=float(cfg["tracking"].get("iou_match_thr", 0.35)),
         max_age=int(cfg["tracking"].get("max_age", 30)),
@@ -133,13 +148,29 @@ def main():
     label_hist: Dict[int, Deque[int]] = defaultdict(lambda: deque(maxlen=int(cfg["inference"].get("label_smooth_window", 9))))
     conf_hist: Dict[int, Deque[float]] = defaultdict(lambda: deque(maxlen=int(cfg["inference"].get("label_smooth_window", 9))))
     stable_label: Dict[int, int] = {}
+    frame_idx = 0
 
     while True:
         ok, frame = cap.read()
         if not ok:
             break
 
-        dets = det.detect(frame)
+        if hybrid_enabled and primary_det is not None:
+            dets = primary_det.detect(frame)
+            verify_every = int(hybrid_cfg.get("verify_every_n_frames", 3))
+            verify_iou_thr = float(hybrid_cfg.get("verify_iou_thr", 0.25))
+            if frame_idx % max(1, verify_every) == 0 and verifier is not None:
+                vdets = verifier.detect(frame)
+                kept = []
+                for d in dets:
+                    max_iou = 0.0
+                    for v in vdets:
+                        max_iou = max(max_iou, iou_xyxy(d.bbox_xyxy, v.bbox_xyxy))
+                    if max_iou >= verify_iou_thr:
+                        kept.append(d)
+                dets = kept
+        else:
+            dets = det.detect(frame)
         det_feats = [_det_appearance_feature(frame, d.bbox_xyxy) for d in dets]
         tracks = tracker.update(dets, det_feats)
         preds: Dict[int, Tuple[str, float]] = {}
@@ -207,6 +238,7 @@ def main():
             except cv2.error as e:
                 print(f"[warn] display is unavailable, switching to headless mode: {e}")
                 args.show = False
+        frame_idx += 1
 
     cap.release()
     if writer is not None:

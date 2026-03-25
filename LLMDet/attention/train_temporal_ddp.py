@@ -90,6 +90,30 @@ def load_yaml(path: Path) -> Dict:
         return yaml.safe_load(f)
 
 
+def compute_confusion_matrix(pred: np.ndarray, target: np.ndarray, num_classes: int) -> np.ndarray:
+    cm = np.zeros((num_classes, num_classes), dtype=np.int64)
+    for t, p in zip(target.tolist(), pred.tolist()):
+        if 0 <= t < num_classes and 0 <= p < num_classes:
+            cm[t, p] += 1
+    return cm
+
+
+def per_class_metrics(cm: np.ndarray) -> Dict[str, List[float]]:
+    num_classes = cm.shape[0]
+    precision, recall, f1 = [], [], []
+    for c in range(num_classes):
+        tp = float(cm[c, c])
+        fp = float(cm[:, c].sum() - tp)
+        fn = float(cm[c, :].sum() - tp)
+        p = tp / (tp + fp + 1e-6)
+        r = tp / (tp + fn + 1e-6)
+        f = 2.0 * p * r / (p + r + 1e-6)
+        precision.append(p)
+        recall.append(r)
+        f1.append(f)
+    return {"precision": precision, "recall": recall, "f1": f1}
+
+
 def train_one_epoch(model, loader, optimizer, scaler, device, cfg, class_weights: torch.Tensor):
     model.train()
     mode = cfg["training"]["mode"]
@@ -137,9 +161,11 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg, class_weights
 
 
 @torch.no_grad()
-def validate(model, loader, device, class_weights: torch.Tensor):
+def validate(model, loader, device, class_weights: torch.Tensor, num_classes: int):
     model.eval()
     losses, accs = [], []
+    all_pred = []
+    all_tgt = []
     for x, y in loader:
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         valid = y >= 0
@@ -148,9 +174,24 @@ def validate(model, loader, device, class_weights: torch.Tensor):
         logits = model(x)
         loss = F.cross_entropy(logits[valid], y[valid], weight=class_weights)
         pred = logits.argmax(dim=-1)
+        all_pred.append(pred[valid].detach().cpu().numpy())
+        all_tgt.append(y[valid].detach().cpu().numpy())
         losses.append(float(loss.item()))
         accs.append(float((pred[valid] == y[valid]).float().mean().item()))
-    return float(np.mean(losses)) if losses else 0.0, float(np.mean(accs)) if accs else 0.0
+    if all_pred:
+        pred_np = np.concatenate(all_pred, axis=0)
+        tgt_np = np.concatenate(all_tgt, axis=0)
+        cm = compute_confusion_matrix(pred_np, tgt_np, num_classes=num_classes)
+        cls = per_class_metrics(cm)
+    else:
+        cm = np.zeros((num_classes, num_classes), dtype=np.int64)
+        cls = {"precision": [0.0] * num_classes, "recall": [0.0] * num_classes, "f1": [0.0] * num_classes}
+    return (
+        float(np.mean(losses)) if losses else 0.0,
+        float(np.mean(accs)) if accs else 0.0,
+        cm,
+        cls,
+    )
 
 
 def main():
@@ -168,6 +209,16 @@ def main():
     num_classes = int(cfg["model"]["num_classes"])
     use_class_weights = bool(cfg["training"].get("use_class_weights", True))
     class_hist = train_set.label_histogram(num_classes)
+    val_hist = val_set.label_histogram(num_classes)
+    required_min_per_class = int(cfg["training"].get("required_min_per_class", 1))
+    enforce_full_class_coverage = bool(cfg["training"].get("enforce_full_class_coverage", True))
+    missing = [i for i, c in enumerate(class_hist.tolist()) if c < required_min_per_class]
+    if enforce_full_class_coverage and missing:
+        raise RuntimeError(
+            f"Insufficient class coverage in training data. class_hist={class_hist.tolist()}, "
+            f"required_min_per_class={required_min_per_class}, missing_class_indices={missing}. "
+            "Add/curate data for missing classes before 4-class training."
+        )
     if use_class_weights:
         # Inverse-frequency weighting to mitigate mode collapse to dominant classes.
         safe = np.maximum(class_hist.astype(np.float32), 1.0)
@@ -178,7 +229,10 @@ def main():
         class_weights_np = np.ones((num_classes,), dtype=np.float32)
     class_weights = torch.from_numpy(class_weights_np).to(device)
     if is_main:
-        print(f"[info] train class_hist={class_hist.tolist()} class_weights={class_weights_np.tolist()}")
+        print(
+            f"[info] train class_hist={class_hist.tolist()} val class_hist={val_hist.tolist()} "
+            f"class_weights={class_weights_np.tolist()}"
+        )
 
     train_sampler = DistributedSampler(train_set, shuffle=True) if ddp else None
     val_sampler = DistributedSampler(val_set, shuffle=False) if ddp else None
@@ -236,7 +290,7 @@ def main():
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         tr_loss, tr_acc = train_one_epoch(model, train_loader, optimizer, scaler, device, cfg, class_weights)
-        va_loss, va_acc = validate(model, val_loader, device, class_weights)
+        va_loss, va_acc, va_cm, va_cls = validate(model, val_loader, device, class_weights, num_classes)
 
         if is_main:
             print(f"[epoch {epoch}] train_loss={tr_loss:.4f} train_acc={tr_acc:.4f} val_loss={va_loss:.4f} val_acc={va_acc:.4f}")
@@ -245,6 +299,10 @@ def main():
                 writer.add_scalar("train/acc", tr_acc, epoch)
                 writer.add_scalar("val/loss", va_loss, epoch)
                 writer.add_scalar("val/acc", va_acc, epoch)
+                for c in range(num_classes):
+                    writer.add_scalar(f"val/class_{c}_precision", float(va_cls["precision"][c]), epoch)
+                    writer.add_scalar(f"val/class_{c}_recall", float(va_cls["recall"][c]), epoch)
+                    writer.add_scalar(f"val/class_{c}_f1", float(va_cls["f1"][c]), epoch)
 
             state = {
                 "epoch": epoch,
@@ -256,11 +314,23 @@ def main():
             if va_acc > best_val:
                 best_val = va_acc
                 torch.save(state, ckpt_dir / "best.pth")
+                np.save(ckpt_dir / "best_val_confusion_matrix.npy", va_cm)
+                with (ckpt_dir / "best_val_class_metrics.json").open("w", encoding="utf-8") as f:
+                    json.dump(va_cls, f, indent=2)
 
     if is_main and writer is not None:
         writer.close()
         with (out_dir / "train_summary.json").open("w", encoding="utf-8") as f:
-            json.dump({"best_val_acc": best_val}, f, indent=2)
+            json.dump(
+                {
+                    "best_val_acc": best_val,
+                    "train_class_hist": class_hist.tolist(),
+                    "val_class_hist": val_hist.tolist(),
+                    "class_weights": class_weights_np.tolist(),
+                },
+                f,
+                indent=2,
+            )
 
     cleanup_ddp()
 

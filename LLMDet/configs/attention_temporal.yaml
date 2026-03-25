@@ -40,6 +40,8 @@ training:
   mode: "supervised" # supervised | semi_supervised
   pseudo_label_threshold: 0.7
   use_class_weights: true
+  enforce_full_class_coverage: true
+  required_min_per_class: 1
   epochs: 30
   batch_size: 32
   num_workers: 4

@@ -318,6 +318,22 @@ Important troubleshooting notes:
   - class-weighted cross entropy in temporal training (`training.use_class_weights: true`).
 - training now prints `class_hist` and `class_weights` at startup so imbalance is explicit.
 
+9. Guarding invalid 4-class training runs
+
+- training now supports hard class-coverage checks:
+  - `training.enforce_full_class_coverage`
+  - `training.required_min_per_class`
+- if any class count is below the threshold, training raises an explicit error and stops.
+- this prevents spending GPU hours on runs where one or more classes are missing.
+
+10. Class-wise evaluation artifacts
+
+- best-validation class metrics are exported to:
+  - `work_dirs/attention_temporal/checkpoints/best_val_class_metrics.json`
+- best-validation confusion matrix is exported to:
+  - `work_dirs/attention_temporal/checkpoints/best_val_confusion_matrix.npy`
+- TensorBoard now logs per-class precision/recall/F1 during validation.
+
 What Phase-1 optimizes for:
 
 - reliable end-to-end pipeline execution with your existing trained detector,

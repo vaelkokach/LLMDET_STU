@@ -465,6 +465,58 @@ Then run:
 python attention_realtime.py --config configs/attention_temporal.yaml --source /path/to/video.mp4 --no-show --out-video work_dirs/attention_temporal/realtime_hybrid.mp4
 ```
 
+#### 5.8 Post-E1 Execution Toolkit (Sanity Checks + Testing)
+
+To execute the full E0/E1/E2 + hybrid + temporal workflow reproducibly, use:
+
+- `experiments/check_training_artifacts.py`
+- `experiments/validate_hardneg_jsonl.py`
+- `experiments/run_detection_ablation.sh`
+- `experiments/refresh_temporal_data.sh`
+- `experiments/package_thesis_artifacts.py`
+
+Phase 0 sanity check (E1 artifacts):
+
+```
+python experiments/check_training_artifacts.py --work-dir work_dirs/grounding_dino_swin_t_student_e1 --print-json
+```
+
+Phase 2 sanity check (hard-negative JSONL):
+
+```
+python experiments/validate_hardneg_jsonl.py \
+  --jsonl ../grounding_data/stu_img/student_hard_negative_vg7_train.jsonl \
+  --image-root ../grounding_data/stu_img/frames \
+  --sample-lines 50
+```
+
+Phase 4 ablation run (E0/E1/E2):
+
+```
+bash experiments/run_detection_ablation.sh \
+  --gpus 8 \
+  --val-config configs/grounding_dino_swin_t_student_e1.py \
+  --e0-ckpt work_dirs/grounding_dino_swin_t/iter_15000.pth \
+  --e1-ckpt work_dirs/grounding_dino_swin_t_student_e1/best.pth \
+  --e2-ckpt work_dirs/grounding_dino_swin_t_student_e2_hardneg/best.pth \
+  --out-root work_dirs/ablation_e0_e1_e2
+```
+
+Phase 6 temporal refresh (sequence rebuild + layout normalization):
+
+```
+bash experiments/refresh_temporal_data.sh
+```
+
+Phase 9 thesis packaging:
+
+```
+python experiments/package_thesis_artifacts.py \
+  --e1-best work_dirs/grounding_dino_swin_t_student_e1/best.pth \
+  --e2-best work_dirs/grounding_dino_swin_t_student_e2_hardneg/best.pth \
+  --bundle-dir work_dirs/thesis_bundle
+```
+
 ### 6 License
 
 LLMDet is released under the Apache 2.0 license. Please see the LICENSE file for more information.

@@ -48,6 +48,25 @@ def _blur_faces(frame: np.ndarray, tracks) -> np.ndarray:
     return out
 
 
+def _det_appearance_feature(frame_bgr: np.ndarray, bbox_xyxy: List[float]) -> np.ndarray:
+    x1, y1, x2, y2 = [int(v) for v in bbox_xyxy]
+    h, w = frame_bgr.shape[:2]
+    x1 = max(0, min(x1, w - 1))
+    x2 = max(0, min(x2, w - 1))
+    y1 = max(0, min(y1, h - 1))
+    y2 = max(0, min(y2, h - 1))
+    if x2 <= x1 or y2 <= y1:
+        return np.zeros((24,), dtype=np.float32)
+    crop = frame_bgr[y1:y2, x1:x2]
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hist_h = cv2.calcHist([hsv], [0], None, [8], [0, 180]).flatten()
+    hist_s = cv2.calcHist([hsv], [1], None, [8], [0, 256]).flatten()
+    hist_v = cv2.calcHist([hsv], [2], None, [8], [0, 256]).flatten()
+    vec = np.concatenate([hist_h, hist_s, hist_v], axis=0).astype(np.float32)
+    vec /= float(np.linalg.norm(vec) + 1e-6)
+    return vec
+
+
 def main():
     args = parse_args()
     cfg = load_yaml(Path(args.config))
@@ -86,6 +105,8 @@ def main():
         iou_match_thr=float(cfg["tracking"].get("iou_match_thr", 0.35)),
         max_age=int(cfg["tracking"].get("max_age", 30)),
         min_hits=int(cfg["tracking"].get("min_hits", 3)),
+        appearance_weight=float(cfg["tracking"].get("appearance_weight", 0.35)),
+        min_match_score=float(cfg["tracking"].get("min_match_score", 0.25)),
     )
     feat = StudentFeatureExtractor(
         clip_model_name=cfg["features"].get("clip_model_name", "openai/clip-vit-base-patch32"),
@@ -119,7 +140,8 @@ def main():
             break
 
         dets = det.detect(frame)
-        tracks = tracker.update(dets)
+        det_feats = [_det_appearance_feature(frame, d.bbox_xyxy) for d in dets]
+        tracks = tracker.update(dets, det_feats)
         preds: Dict[int, Tuple[str, float]] = {}
 
         active_ids = set()

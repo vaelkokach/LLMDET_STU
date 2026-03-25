@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -30,34 +30,60 @@ def iou_xyxy(a: List[float], b: List[float]) -> float:
 
 class IoUTracker:
     """
-    Lightweight online tracker for Phase 1.
+    Robust online tracker with IoU + appearance association.
     """
 
-    def __init__(self, iou_match_thr: float = 0.35, max_age: int = 30, min_hits: int = 3):
+    def __init__(
+        self,
+        iou_match_thr: float = 0.35,
+        max_age: int = 30,
+        min_hits: int = 3,
+        appearance_weight: float = 0.35,
+        min_match_score: float = 0.25,
+    ):
         self.iou_match_thr = iou_match_thr
         self.max_age = max_age
         self.min_hits = min_hits
+        self.appearance_weight = appearance_weight
+        self.min_match_score = min_match_score
         self.next_id = 1
         self.tracks: Dict[int, List[float]] = {}
         self.ages: Dict[int, int] = {}
         self.hits: Dict[int, int] = {}
+        self.track_feat: Dict[int, np.ndarray] = {}
 
-    def update(self, detections: List[DetectionResult]) -> List[Track]:
+    @staticmethod
+    def _cosine_sim(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> float:
+        if a is None or b is None:
+            return 0.0
+        da = float(np.linalg.norm(a))
+        db = float(np.linalg.norm(b))
+        if da <= 1e-6 or db <= 1e-6:
+            return 0.0
+        return float(np.dot(a, b) / (da * db))
+
+    def update(self, detections: List[DetectionResult], det_features: Optional[List[np.ndarray]] = None) -> List[Track]:
         det_used = set()
         matched: List[Tuple[int, int]] = []
         active_ids = list(self.tracks.keys())
+        if det_features is None:
+            det_features = [None for _ in detections]
 
         for tid in active_ids:
             best_det = -1
-            best_iou = 0.0
+            best_score = -1.0
             for di, det in enumerate(detections):
                 if di in det_used:
                     continue
                 ov = iou_xyxy(self.tracks[tid], det.bbox_xyxy)
-                if ov > best_iou:
-                    best_iou = ov
+                if ov < self.iou_match_thr * 0.5:
+                    continue
+                app = self._cosine_sim(self.track_feat.get(tid), det_features[di])
+                match_score = (1.0 - self.appearance_weight) * ov + self.appearance_weight * max(0.0, app)
+                if match_score > best_score:
+                    best_score = match_score
                     best_det = di
-            if best_det >= 0 and best_iou >= self.iou_match_thr:
+            if best_det >= 0 and best_score >= self.min_match_score:
                 matched.append((tid, best_det))
                 det_used.add(best_det)
 
@@ -65,6 +91,9 @@ class IoUTracker:
             self.tracks[tid] = detections[di].bbox_xyxy
             self.ages[tid] = 0
             self.hits[tid] = self.hits.get(tid, 0) + 1
+            if det_features[di] is not None:
+                prev = self.track_feat.get(tid, det_features[di])
+                self.track_feat[tid] = 0.8 * prev + 0.2 * det_features[di]
 
         for di, det in enumerate(detections):
             if di in det_used:
@@ -74,6 +103,8 @@ class IoUTracker:
             self.tracks[tid] = det.bbox_xyxy
             self.ages[tid] = 0
             self.hits[tid] = 1
+            if det_features[di] is not None:
+                self.track_feat[tid] = det_features[di]
 
         remove = []
         matched_ids = {tid for tid, _ in matched}
@@ -86,6 +117,7 @@ class IoUTracker:
             self.tracks.pop(tid, None)
             self.ages.pop(tid, None)
             self.hits.pop(tid, None)
+            self.track_feat.pop(tid, None)
 
         output = []
         for tid, bbox in self.tracks.items():

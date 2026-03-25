@@ -18,14 +18,25 @@ CLASS_TO_ID = {c: i for i, c in enumerate(CLASS_NAMES)}
 WEAK_LABEL_MAP = {
     "focused": "attentive",
     "thinking": "attentive",
+    "concentrated": "attentive",
+    "studying": "attentive",
     "typing": "engaged",
+    "writing": "engaged",
+    "reading": "engaged",
     "engaged": "engaged",
     "looking at screen": "engaged",
+    "looking at monitor": "engaged",
     "curious": "engaged",
     "calm": "attentive",
     "resting hand": "distracted",
+    "looking away": "distracted",
+    "talking": "distracted",
+    "chatting": "distracted",
+    "phone": "distracted",
+    "idle": "distracted",
     "distracted": "distracted",
     "sleeping": "sleeping",
+    "eyes closed": "sleeping",
     "tired": "sleeping",
     "yawning": "sleeping",
 }
@@ -61,14 +72,14 @@ def _extract_timestamp(filename: str) -> str:
     return ts[0] if ts else "00000000000000"
 
 
-def _region_to_label(region_phrase: str, tags: List[str], caption: str) -> int:
+def _region_to_label(region_phrase: str, tags: List[str], caption: str) -> Optional[int]:
     text = " ".join([region_phrase, caption] + tags).lower()
     scores = defaultdict(int)
     for key, cls in WEAK_LABEL_MAP.items():
         if key in text:
             scores[cls] += 1
     if not scores:
-        return CLASS_TO_ID["attentive"]
+        return None
     cls = sorted(scores.items(), key=lambda x: x[1], reverse=True)[0][0]
     return CLASS_TO_ID[cls]
 
@@ -106,6 +117,8 @@ def parse_jsonl(jsonl_path: Path) -> Dict[str, List[RegionObs]]:
                     continue
                 phrase = reg.get("phrase", "")
                 label_id = _region_to_label(phrase, tags, caption)
+                if label_id is None:
+                    continue
                 by_video[video_id].append(
                     RegionObs(
                         filename=fname,

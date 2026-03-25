@@ -40,6 +40,17 @@ class SequenceNPZDataset(Dataset):
         y = int(item["y"].item()) if "y" in item else -1
         return torch.from_numpy(x), torch.tensor(y, dtype=torch.long)
 
+    def label_histogram(self, num_classes: int) -> np.ndarray:
+        hist = np.zeros((num_classes,), dtype=np.int64)
+        for fp in self.files:
+            item = np.load(fp)
+            if "y" not in item:
+                continue
+            y = int(item["y"].item())
+            if 0 <= y < num_classes:
+                hist[y] += 1
+        return hist
+
 
 def collate_varlen(batch):
     xs, ys = zip(*batch)
@@ -79,7 +90,7 @@ def load_yaml(path: Path) -> Dict:
         return yaml.safe_load(f)
 
 
-def train_one_epoch(model, loader, optimizer, scaler, device, cfg):
+def train_one_epoch(model, loader, optimizer, scaler, device, cfg, class_weights: torch.Tensor):
     model.train()
     mode = cfg["training"]["mode"]
     pseudo_thr = float(cfg["training"].get("pseudo_label_threshold", 0.7))
@@ -98,7 +109,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg):
             loss = torch.tensor(0.0, device=device)
             total = 0
             if valid.any():
-                loss = loss + F.cross_entropy(logits[valid], y[valid])
+                loss = loss + F.cross_entropy(logits[valid], y[valid], weight=class_weights)
                 total += 1
 
             if mode == "semi_supervised":
@@ -108,7 +119,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg):
                     pseudo_mask = unlabeled & (conf >= pseudo_thr)
                     if pseudo_mask.any():
                         pseudo = pred.detach()
-                        loss = loss + F.cross_entropy(logits[pseudo_mask], pseudo[pseudo_mask])
+                        loss = loss + F.cross_entropy(logits[pseudo_mask], pseudo[pseudo_mask], weight=class_weights)
                         total += 1
             if total == 0:
                 continue
@@ -126,7 +137,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg):
 
 
 @torch.no_grad()
-def validate(model, loader, device):
+def validate(model, loader, device, class_weights: torch.Tensor):
     model.eval()
     losses, accs = [], []
     for x, y in loader:
@@ -135,7 +146,7 @@ def validate(model, loader, device):
         if not valid.any():
             continue
         logits = model(x)
-        loss = F.cross_entropy(logits[valid], y[valid])
+        loss = F.cross_entropy(logits[valid], y[valid], weight=class_weights)
         pred = logits.argmax(dim=-1)
         losses.append(float(loss.item()))
         accs.append(float((pred[valid] == y[valid]).float().mean().item()))
@@ -154,6 +165,20 @@ def main():
     seq_root = Path(cfg["data"]["sequence_dir"])
     train_set = SequenceNPZDataset(seq_root / "train")
     val_set = SequenceNPZDataset(seq_root / "val")
+    num_classes = int(cfg["model"]["num_classes"])
+    use_class_weights = bool(cfg["training"].get("use_class_weights", True))
+    class_hist = train_set.label_histogram(num_classes)
+    if use_class_weights:
+        # Inverse-frequency weighting to mitigate mode collapse to dominant classes.
+        safe = np.maximum(class_hist.astype(np.float32), 1.0)
+        inv = 1.0 / safe
+        inv = inv / np.sum(inv) * num_classes
+        class_weights_np = inv.astype(np.float32)
+    else:
+        class_weights_np = np.ones((num_classes,), dtype=np.float32)
+    class_weights = torch.from_numpy(class_weights_np).to(device)
+    if is_main:
+        print(f"[info] train class_hist={class_hist.tolist()} class_weights={class_weights_np.tolist()}")
 
     train_sampler = DistributedSampler(train_set, shuffle=True) if ddp else None
     val_sampler = DistributedSampler(val_set, shuffle=False) if ddp else None
@@ -210,8 +235,8 @@ def main():
     for epoch in range(epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        tr_loss, tr_acc = train_one_epoch(model, train_loader, optimizer, scaler, device, cfg)
-        va_loss, va_acc = validate(model, val_loader, device)
+        tr_loss, tr_acc = train_one_epoch(model, train_loader, optimizer, scaler, device, cfg, class_weights)
+        va_loss, va_acc = validate(model, val_loader, device, class_weights)
 
         if is_main:
             print(f"[epoch {epoch}] train_loss={tr_loss:.4f} train_acc={tr_acc:.4f} val_loss={va_loss:.4f} val_acc={va_acc:.4f}")

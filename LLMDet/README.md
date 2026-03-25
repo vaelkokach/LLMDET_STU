@@ -301,6 +301,23 @@ Important troubleshooting notes:
   - `inference.label_switch_margin`
 - `tracking.min_hits` can also reduce unstable short-lived IDs.
 
+7. IDs switch frequently or non-student objects receive IDs
+
+- tracker now uses IoU + appearance matching (`tracking.appearance_weight`, `tracking.min_match_score`) for stronger identity consistency.
+- student filtering now combines confidence, geometry and NMS in detector adapter.
+- tune these keys first:
+  - `detector.score_thr`
+  - `detector.min_rel_area`, `detector.max_rel_area`
+  - `tracking.iou_match_thr`, `tracking.max_age`, `tracking.min_hits`
+
+8. Model predicts mostly one class (for example always `attentive`)
+
+- rebuild sequences and retrain after the latest updates:
+  - expanded weak-label mapping,
+  - unknown-label skipping in sequence generation,
+  - class-weighted cross entropy in temporal training (`training.use_class_weights: true`).
+- training now prints `class_hist` and `class_weights` at startup so imbalance is explicit.
+
 What Phase-1 optimizes for:
 
 - reliable end-to-end pipeline execution with your existing trained detector,
